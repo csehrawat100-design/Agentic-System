@@ -1,0 +1,158 @@
+from openai import OpenAI
+from pypdf import PdfReader
+import os
+import re
+import chromadb
+
+client = OpenAI()
+LLM_model = "gpt-3.5-turbo"
+embedding_model = "text-embedding-3-small"
+
+def infra_policy_types(source_name: str) -> str:
+    lower_source_name = source_name.lower()
+    if "hostel" in lower_source_name:
+        return "Hostel Policy"
+    elif "library" in lower_source_name:
+        return "Library Policy"
+    elif "refund" in lower_source_name:
+        return "Refund Policy"
+    else:
+        return "General Policy"
+
+def clean_text(text: str) -> str:
+    text = text.replace("\n", " ")
+    text = re.sub(r"\s+", " ", text)
+    text = text.strip()
+    return text
+
+def load_pdf_file(file_path: Path) -> List[Dict[str, Any]]:
+    documents = []
+    policy_type = infra_policy_types(os.path.basename(file_path))
+    reader = PdfReader(str(file_path))
+
+    for page_num, page in enumerate(reader.pages, start = 1):
+        text = page.extract_text()
+        
+        if not raw_text:
+            continue
+
+        cleaned_text = clean_text(text)
+        if cleaned_text:
+           metadata = {
+                "source": os.path.basename(file_path), 
+                "page": page_num,
+                "policy_type": policy_type
+            }
+            documents.append({"text": cleaned_text, "metadata": metadata})
+    
+    return documents
+
+def load_documents_from_directory(directory_path: Path) -> List[Dict[str, Any]]:
+    all_documents = []
+    for filename in os.listdir(directory_path):
+        if filename.endswith(".pdf"):
+            file_path = os.path.join(directory_path, filename)
+            documents = load_pdf_file(file_path)
+            all_documents.extend(documents)
+    return all_documents
+
+def chunk_text(text: str, chunk_size: int = 100, overlap: int = 50) -> List[str]:
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        chunks.append(text[start:end])
+        start += chunk_size - overlap
+    return chunks
+
+def create_chunked_documents(documents: List[Dict[str, Any]], chunk_size: int = 100, overlap: int = 50) -> List[Dict[str, Any]]:
+    chunked_documents = []
+    for doc in documents:
+        text_chunks = chunk_text(doc["text"], chunk_size, overlap)
+        for i,chunk in enumerate(text_chunks):
+            chunked_doc = {
+                "text": chunk,
+                "metadata": doc["metadata"],
+                "chunk_index": i    
+            }
+            chunked_documents.append(chunked_doc)
+    return chunked_documents
+
+def create_embeddings_for_documents(text):
+    response = client.embeddings.create(
+        input = text,
+        model = embedding_model
+    )
+    embeddings = [embedding.embedding for embedding in response.data]
+
+    return embeddings
+
+def setup_vector_db():
+    chroma_client = chromadb.PersistentClient(path="./chroma_db")
+    collection = chroma_client.get_or_create_collection(
+        name="campus_policies",
+        embedding_function=None
+    )
+    return collection
+
+def index_chunked_documents(collection, chunked_documents):
+    texts = [doc["text"] for doc in chunked_documents]
+    embeddings = create_embeddings_for_documents(texts) 
+    
+    ids = [doc["chunk_index"] for doc in chunked_documents]
+    metadatas = [doc["metadata"] for doc in chunked_documents]
+    collection.upsert(
+        ids=ids,
+        embeddings=embeddings,
+        metadatas=metadatas,
+        documents=texts
+    )
+
+def build_knowledge_base(folder_path, collection, chunk_size=120, overlap=30):
+    documents = load_documents_from_directory(folder_path)
+    chunked_documents = create_chunked_documents(documents, chunk_size, overlap)
+    index_chunked_documents(collection, chunked_documents)
+
+def retrieve_relevant_chunks(query, collection, top_k=3):
+    query_embedding = create_embeddings_for_documents([query])[0]
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=top_k,
+    )
+    relevant_chunks = []
+    for i in range(len(results["ids"][0])):
+        relevant_chunks.append({
+            "id": results["ids"][0][i],
+            "text": results["documents"][0][i],
+            "metadata": results["metadatas"][0][i],
+            "distance": results["distances"][0][i]
+        })
+    return relevant_chunks
+
+def build_grounded_prompt(query, relevant_chunks):
+    prompt = f"Campus Policy Query: {query}\n\nRelevant Policy Chunks:\n"
+    for chunk in relevant_chunks:
+        prompt += f"- {chunk['id']} ({chunk['metadata']['source']} - Page {chunk['metadata']['page']} - {chunk['metadata']['policy_type']}): {chunk['text']}\n"
+    prompt += "\nBased on the above policy chunks, provide a clear and concise answer to the campus policy query, I don't have that information, if the context does not contain the answer."
+    return prompt
+
+def generate_response_with_rag(query, collection):
+    relevant_chunks = retrieve_relevant_chunks(query, collection)
+    prompt = build_grounded_prompt(query, relevant_chunks)
+
+    response = client.chat.completions.create(
+        model=LLM_model,
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant that provides answers based on campus policies."},
+            {"role": "user", "content": prompt}
+         ]
+    )
+    return response.choices[0].message.content.strip()
+
+collection = setup_vector_db()
+build_knowledge_base("./policy_documents", collection)
+
+query = "What is the policy for hostel accommodation during holidays?"
+response = generate_response_with_rag(query, collection)
+print("RAG Response:")
+print(response)
